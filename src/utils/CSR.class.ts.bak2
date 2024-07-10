@@ -1,0 +1,169 @@
+import * as crypto from "crypto";
+import * as asn1 from "asn1";
+
+type KeyPairs = {
+  publicKey: string;
+  privateKey: string;
+};
+
+type CertificateDN = {
+  countryName: string;
+  stateOrProvinceName: string;
+  localityName: string;
+  organizationName: string;
+  organizationalUnitName?: string;
+  commonName: string;
+  emailAddress?: string;
+};
+
+export class EcdsaCsrGenerator {
+  private keyPairs: KeyPairs;
+  private certificateDN: CertificateDN;
+
+  constructor(certificateDN: CertificateDN) {
+    this.certificateDN = certificateDN;
+    this.keyPairs = this.generateKeyPairs();
+  }
+
+  private generateKeyPairs(): KeyPairs {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", {
+      namedCurve: "prime256v1",
+      publicKeyEncoding: {
+        type: "spki",
+        format: "pem",
+      },
+      privateKeyEncoding: {
+        type: "pkcs8",
+        format: "pem",
+      },
+    });
+
+    return { publicKey, privateKey };
+  }
+
+  private createCsrInfo(): Buffer {
+    const writer = new asn1.BerWriter();
+
+    // Write CSRInfo as a sequence
+    writer.startSequence(); // CSRInfo
+    writer.writeInt(0); // version (0 for CSR)
+    this.writeDN(writer); // Write Subject (DN)
+    this.writePublicKey(writer); // Write Subject Public Key Info
+    writer.startSequence(asn1.Ber.Constructor | asn1.Ber.Context);
+    writer.endSequence(); // End of Attributes
+
+    writer.endSequence(); // End of CSRInfo
+
+    return writer.buffer;
+  }
+
+  private writeDN(writer: asn1.BerWriter): void {
+    writer.startSequence(); // Subject
+    writer.startSequence(); // Sequence of Relative Distinguished Names (RDNs)
+
+    // Write each RDN (Relative Distinguished Name)
+    this.writeRdn(writer, "2.5.4.6", this.certificateDN.countryName); // countryName
+    this.writeRdn(writer, "2.5.4.8", this.certificateDN.stateOrProvinceName); // stateOrProvinceName
+    this.writeRdn(writer, "2.5.4.7", this.certificateDN.localityName); // localityName
+    this.writeRdn(writer, "2.5.4.10", this.certificateDN.organizationName); // organizationName
+
+    if (this.certificateDN.organizationalUnitName) {
+      this.writeRdn(
+        writer,
+        "2.5.4.11",
+        this.certificateDN.organizationalUnitName
+      ); // organizationalUnitName
+    }
+
+    this.writeRdn(writer, "2.5.4.3", this.certificateDN.commonName); // commonName
+
+    if (this.certificateDN.emailAddress) {
+      writer.startSequence(); // emailAddress
+      writer.writeOID("1.2.840.113549.1.9.1", asn1.Ber.OID);
+      writer.writeString(this.certificateDN.emailAddress, asn1.Ber.IA5String);
+      writer.endSequence(); // End of emailAddress
+    }
+
+    writer.endSequence(); // End of Sequence of RDNs
+    writer.endSequence(); // End of Subject
+  }
+
+  private writeRdn(writer: asn1.BerWriter, oid: string, value: string): void {
+    writer.startSequence(); // RDN
+    writer.writeOID(oid, asn1.Ber.OID);
+    writer.writeString(value, asn1.Ber.PrintableString);
+    writer.endSequence(); // End of RDN
+  }
+
+  private writePublicKey(writer: asn1.BerWriter): void {
+    const publicKeyBuffer = Buffer.from(
+      this.keyPairs.publicKey.replace(
+        /-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|\n/g,
+        ""
+      ),
+      "base64"
+    );
+
+    writer.startSequence(); // Subject Public Key Info
+    writer.startSequence(); // Algorithm
+    writer.writeOID("1.2.840.10045.2.1", asn1.Ber.OID); // ecPublicKey
+    writer.writeOID("1.2.840.10045.3.1.7", asn1.Ber.OID); // prime256v1 / secp256r1
+    writer.endSequence(); // End of Algorithm
+    writer.writeBuffer(publicKeyBuffer, asn1.Ber.BitString); // Public Key
+    writer.endSequence(); // End of Subject Public Key Info
+  }
+
+  private signCsrInfo(csrInfo: Buffer): Buffer {
+    const sign = crypto.createSign("SHA256");
+    sign.update(csrInfo);
+    return sign.sign(this.keyPairs.privateKey);
+  }
+
+  public exportCsr(): string {
+    const csrInfo = this.createCsrInfo();
+    const signature = this.signCsrInfo(csrInfo);
+
+    const writer = new asn1.BerWriter();
+    writer.startSequence(); // Start of CSR
+
+    // Write CSRInfo manually as a sequence
+    writer.writeBuffer(csrInfo, asn1.Ber.Sequence);
+    writer.startSequence(); // Signature Algorithm
+    writer.writeOID("1.2.840.10045.4.3.2", asn1.Ber.OID); // ecdsa-with-SHA256
+    writer.endSequence(); // End of Signature Algorithm
+    writer.startSequence();
+    writer.writeOID("1.3.6.1.4.1.311.20.2", asn1.Ber.OID); // Microsoft Extension OID
+    writer.writeBuffer(
+      Buffer.from("5ATCA-Code-Signing", "utf8"),
+      asn1.Ber.OctetString
+    ); // Example value as OCTET STRING
+    writer.endSequence();
+
+    writer.writeBuffer(signature, asn1.Ber.BitString); // Signature
+    writer.endSequence(); // End of CSR
+
+    const finalCsr = writer.buffer;
+    if (!finalCsr) {
+      throw new Error("Failed to generate CSR.");
+    }
+
+    const pemCsr = `-----BEGIN CERTIFICATE REQUEST-----\n${csrInfo.toString(
+      "base64"
+    )}\n-----END CERTIFICATE REQUEST-----\n`;
+
+    return pemCsr;
+  }
+}
+
+// Example usage
+const generator = new EcdsaCsrGenerator({
+  countryName: "US",
+  stateOrProvinceName: "California",
+  localityName: "San Francisco",
+  organizationName: "My Company",
+  commonName: "www.example.com",
+  emailAddress: "admin@example.com",
+});
+
+const csr = generator.exportCsr();
+console.log("Generated CSR:\n", csr);
